@@ -1,0 +1,10 @@
+[build]
+  publish = "public"
+  functions = "netlify/functions"
+  command = "node scripts/build-seed-bundle.js"
+
+[functions]
+  node_bundler = "esbuild"
+
+# The site is static HTML; each page is a real file in public/, so no SPA
+# redirect is needed. /api/* and /uploads/* are served by Netlify Functions.

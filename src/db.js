@@ -1,80 +1,65 @@
-const path = require('path');
-const fs = require('fs');
-const Database = require('better-sqlite3');
+// Postgres-backed database access via Netlify Database (native driver).
+// Replaces the old better-sqlite3 synchronous client. All queries here are
+// async; callers in src/*.js were converted to async/await accordingly.
+const { getDatabase } = require('@netlify/database');
 
-const DATA_DIR = path.join(__dirname, '..', 'data');
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+let _db;
+function db() {
+  if (!_db) _db = getDatabase();
+  return _db;
+}
 
-const db = new Database(path.join(DATA_DIR, 'vibe-arcade.db'));
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+// Tagged-template helper that returns rows (array of plain objects).
+async function sql(strings, ...values) {
+  const res = await db().sql(strings, ...values);
+  // native driver returns { rows: [], ... } for SELECTs
+  return Array.isArray(res) ? res : (res.rows || []);
+}
 
-db.exec(`
-CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  username TEXT UNIQUE NOT NULL COLLATE NOCASE,
-  password_hash TEXT NOT NULL,
-  admin INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
+// Raw SQL with explicit params ($1, $2, ...). Use when the SQL string is built
+// dynamically (e.g. conditional WHERE clauses / sort orders) and can't be a
+// static tagged template.
+async function query(text, params = []) {
+  const client = await db().pool.connect();
+  try {
+    const r = await client.query(text, params);
+    return r.rows;
+  } finally {
+    client.release();
+  }
+}
 
-CREATE TABLE IF NOT EXISTS games (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  title TEXT NOT NULL,
-  description TEXT NOT NULL DEFAULT '',
-  type TEXT NOT NULL CHECK (type IN ('web','download')),
-  entry_path TEXT NOT NULL DEFAULT '',
-  has_source INTEGER NOT NULL DEFAULT 0,
-  screenshot_path TEXT,
-  views INTEGER NOT NULL DEFAULT 0,
-  downloads INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
+// Returns the first row or undefined.
+async function sqlOne(strings, ...values) {
+  const rows = await sql(strings, ...values);
+  return rows[0];
+}
 
-CREATE TABLE IF NOT EXISTS tags (
-  game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
-  tag TEXT NOT NULL,
-  PRIMARY KEY (game_id, tag)
-);
-CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);
+// Postgres uses SERIAL for auto-increment; lastInsertRowid isn't available on
+// the driver result object, so INSERT...RETURNING id is used by callers.
+async function insertReturning(strings, ...values) {
+  const res = await db().sql(strings, ...values);
+  const rows = Array.isArray(res) ? res : (res.rows || []);
+  return rows[0];
+}
 
-CREATE TABLE IF NOT EXISTS likes (
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  PRIMARY KEY (user_id, game_id)
-);
+// Run a transaction body. The Netlify database driver exposes a connection
+// pool via db.pool; we use a single client for BEGIN/COMMIT/ROLLBACK.
+async function tx(fn) {
+  const client = await db().pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn({
+      query: (text, params) => client.query(text, params).then(r => r.rows),
+    });
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
 
-CREATE TABLE IF NOT EXISTS ratings (
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
-  stars INTEGER NOT NULL CHECK (stars BETWEEN 1 AND 5),
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  PRIMARY KEY (user_id, game_id)
-);
-
-CREATE TABLE IF NOT EXISTS comments (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
-  body TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS reports (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  reporter_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  game_id INTEGER REFERENCES games(id) ON DELETE CASCADE,
-  comment_id INTEGER REFERENCES comments(id) ON DELETE CASCADE,
-  reason TEXT NOT NULL DEFAULT '',
-  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','resolved')),
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status);
-`);
-
-// migration for databases created before the admin column existed
-try { db.exec('ALTER TABLE users ADD COLUMN admin INTEGER NOT NULL DEFAULT 0'); } catch { /* column already exists */ }
-
-module.exports = db;
+module.exports = { sql, sqlOne, insertReturning, tx, query };
